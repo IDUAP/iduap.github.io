@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ID UAPs</title>
+    <!-- Leaflet Map CSS -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: sans-serif;
+      }
+      #map {
+        height: 80vh;
+        width: 100%;
+        background: #eee;
+      }
+      #controls {
+        padding: 15px;
+        background: #f4f4f4;
+        display: flex;
+        gap: 15px;
+        align-items: center;
+      }
+      .btn {
+        padding: 10px 20px;
+        background: #007bff;
+        color: white;
+        border: none;
+        cursor: pointer;
+        border-radius: 4px;
+        font-weight: bold;
+      }
+      .btn-recording {
+        background: #dc3545;
+      }
+      #location-container {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      #cityInput {
+        padding: 8px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        width: 200px;
+      }
+      #records-section {
+        padding: 20px;
+        background: #fff;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+      }
+      th,
+      td {
+        border: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
+      }
+      th {
+        background-color: #f2f2f2;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="controls">
+      <button id="recordBtn" class="btn">🔴 Start Recording</button>
+      <div id="location-container">
+        <input
+          type="text"
+          id="cityInput"
+          placeholder="Enter city name (e.g. Utrecht)..."
+        />
+        <button id="searchBtn" class="btn">Search</button>
+      </div>
+    </div>
+
+    <div id="map"></div>
+
+    <div id="records-section">
+      <h3>🔴 Saved Recordings (Local Browser Storage)</h3>
+      <table id="recordsTable">
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Location</th>
+            <th>Aircraft Count</th>
+            <th>Satellite Count</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- External Library CDNs -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/1.3.0/satellite.min.js"></script>
+
+    <script>
+      let map;
+      let userLat = 52.0907; // Default: Utrecht
+      let userLon = 5.1214;
+      let airplaneMarkers = {};
+      let satelliteMarkers = {};
+      let userMarker = null;
+      let rawSatelliteData = [];
+
+      let isRecording = false;
+      let recordedAirplanes = [];
+      let recordedSatellites = [];
+      let airplaneHistory = {};
+      let activeFlightPath = null;
+      let activeTrackedHex = null;
+
+      // Core window loader to isolate local file:/// evaluation sync issues
+      window.onload = () => {
+        startRadar(userLat, userLon, 8);
+        loadLocalRecords();
+
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            startRadar(position.coords.latitude, position.coords.longitude, 9);
+          },
+          (error) => {
+            console.log("GPS access denied, tracking fallback location.");
+          },
+        );
+
+        document
+          .getElementById("searchBtn")
+          .addEventListener("click", handleManualSearch);
+        document
+          .getElementById("cityInput")
+          .addEventListener("keypress", (e) => {
+            if (e.key === "Enter") handleManualSearch();
+          });
+        setupRecording();
+      };
+
+      function startRadar(lat, lon, zoomLevel) {
+        userLat = lat;
+        userLon = lon;
+
+        if (!map) {
+          map = L.map("map").setView([userLat, userLon], zoomLevel);
+          L.tileLayer(
+            "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+          ).addTo(map);
+        } else {
+          map.setView([userLat, userLon], zoomLevel);
+        }
+
+        if (userMarker) map.removeLayer(userMarker);
+        userMarker = L.marker([userLat, userLon])
+          .addTo(map)
+          .bindPopup("Radar Center Point")
+          .openPopup();
+
+        fetchAirplanes();
+        //fetchSatellites();
+      }
+
+      async function handleManualSearch() {
+        const query = document.getElementById("cityInput").value.trim();
+        if (!query) return;
+        try {
+          const res = await fetch(
+            "https://openstreetmap.org" + encodeURIComponent(query),
+          );
+          const data = await res.json();
+          if (data && data.length > 0) {
+            startRadar(parseFloat(data.lat), parseFloat(data.lon), 11);
+          } else {
+            alert("City not found. Please try again.");
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      // Live Aircraft Extraction through adsb.lol via AllOrigins Proxy
+      async function fetchAirplanes() {
+        if (
+          userLat === null ||
+          userLon === null ||
+          typeof L === "undefined" ||
+          !map
+        )
+          return;
+        try {
+          // 1. Calculate a box profile (~150km) based on your current location configuration
+          const delta = 1.5;
+          const minLat = userLat - delta;
+          const maxLat = userLat + delta;
+          const minLon = userLon - delta;
+          const maxLon = userLon + delta;
+
+          const targetUrl =
+            "https://api.adsb.lol/v2/lat/" +
+            userLat +
+            "/lon/" +
+            userLon +
+            "/dist/100";
+
+          const response = await fetch(targetUrl);
+          const json = await response.json();
+
+          // FIX: Assign the incoming payload directly to the "data" object
+          // We completely skip the obsolete "json.contents" parsing logic!
+          const data = json;
+          if (!data || !data.ac) return;
+
+          const currentHexCodes = data.ac.map((a) => a.hex);
+
+          Object.keys(airplaneMarkers).forEach((hex) => {
+            if (!currentHexCodes.includes(hex)) {
+              map.removeLayer(airplaneMarkers[hex]);
+              delete airplaneMarkers[hex];
+              delete airplaneHistory[hex];
+
+              if (activeTrackedHex === hex && activeFlightPath) {
+                map.removeLayer(activeFlightPath);
+                activeFlightPath = null;
+                activeTrackedHex = null;
+              }
+            }
+          });
+
+          data.ac.forEach((aircraft) => {
+            if (!aircraft || !aircraft.hex || !aircraft.lat || !aircraft.lon)
+              return;
+
+            const groundTrack =
+              aircraft.track !== undefined ? aircraft.track : aircraft.dir || 0;
+            const altitude = aircraft.alt_baro || 0;
+            const typeCode = aircraft.t || "Unknown";
+            const category = aircraft.category || "";
+
+            const flightInfo = {
+              icao: aircraft.hex,
+              callsign: aircraft.flight ? aircraft.flight.trim() : "Unknown",
+              altitude: altitude,
+              speed: aircraft.gs || 0,
+              lat: aircraft.lat,
+              lon: aircraft.lon,
+              type: typeCode,
+              heading: groundTrack,
+            };
+
+            if (isRecording) {
+              recordedAirplanes.push({ timestamp: new Date(), ...flightInfo });
+            }
+
+            if (!airplaneHistory[aircraft.hex]) {
+              airplaneHistory[aircraft.hex] = [];
+            }
+            airplaneHistory[aircraft.hex].push([aircraft.lat, aircraft.lon]);
+            if (airplaneHistory[aircraft.hex].length > 200) {
+              airplaneHistory[aircraft.hex].shift();
+            }
+
+            // ADSB Elevation Color Scale
+            let planeColor = "#ff0000";
+            if (
+              altitude === 0 ||
+              aircraft.alt_baro === "ground" ||
+              aircraft.ground === true
+            )
+              planeColor = "#808080";
+            else if (altitude >= 10 && altitude < 1000) planeColor = "#ff0000";
+            else if (altitude >= 1000 && altitude < 3000)
+              planeColor = "#ff4500";
+            else if (altitude >= 3000 && altitude < 6000)
+              planeColor = "#ff8c00";
+            else if (altitude >= 6000 && altitude < 9000)
+              planeColor = "#ffea00";
+            else if (altitude >= 9000 && altitude < 12000)
+              planeColor = "#ccff00";
+            else if (altitude >= 12000 && altitude < 15000)
+              planeColor = "#00ff00";
+            else if (altitude >= 15000 && altitude < 18000)
+              planeColor = "#00ffaa";
+            else if (altitude >= 18000 && altitude < 22000)
+              planeColor = "#00ffff";
+            else if (altitude >= 22000 && altitude < 26000)
+              planeColor = "#00aaff";
+            else if (altitude >= 26000 && altitude < 30000)
+              planeColor = "#0055ff";
+            else if (altitude >= 30000 && altitude < 34000)
+              planeColor = "#0000ff";
+            else if (altitude >= 34000 && altitude < 38000)
+              planeColor = "#7a00ff";
+            else if (altitude >= 38000) planeColor = "#ff00ff";
+
+            const isHelicopter = category === "A7" || typeCode.startsWith("H");
+            const isHotAirBalloon = category === "A6" || typeCode === "BALL";
+
+            let svgContent = "";
+            let vehicleEmoji;
+            let endHeading = groundTrack;
+
+            if (isHelicopter) {
+              vehicleEmoji = "🚁 Helicopter:";
+              svgContent =
+                '<path fill="' +
+                planeColor +
+                '" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" d="M16,3 C14,3 13,5 13,8 L13,17 L15,17 L15,26 L11,26 L11,29 L21,29 L21,26 L17,26 L17,17 L19,17 L19,8 C19,5 18,3 16,3 Z" /><circle cx="16" cy="10" r="2" fill="#000000" /><line x1="16" y1="10" x2="7" y2="1" stroke="#000000" stroke-width="2.5" stroke-linecap="round" /><line x1="16" y1="10" x2="25" y2="1" stroke="#000000" stroke-width="2.5" stroke-linecap="round" /><line x1="16" y1="10" x2="7" y2="19" stroke="#000000" stroke-width="2.5" stroke-linecap="round" /><line x1="16" y1="10" x2="25" y2="19" stroke="#000000" stroke-width="2.5" stroke-linecap="round" />';
+            } else if (isHotAirBalloon) {
+              endHeading = 0;
+              vehicleEmoji = "🎈 Hot Air Balloon:";
+              svgContent =
+                '<path fill="' +
+                planeColor +
+                '" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" d="M16,8 C19.5,8 22.5,10.5 22.5,14.5 C22.5,17.5 20,21 17.5,23 L17.5,24.5 C17.5,25.5 17,26 16.5,26 L15.5,26 C15,26 14.5,25.5 14.5,24.5 L14.5,23 C12,21 9.5,17.5 9.5,14.5 C9.5,10.5 12.5,8 16,8 Z M14.5,23 L17.5,23 M15,24.5 L17,24.5" />';
+            } else {
+              vehicleEmoji = "✈️ Airplane:";
+              svgContent =
+                '<path fill="' +
+                planeColor +
+                '" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" d="M16,2 L17.5,12 L30,17 L30,19.5 L17.5,17 L17.5,25 L21.5,28 L21.5,29.5 L16,28 L10.5,29.5 L10.5,28 L14.5,25 L14.5,17 L2,19.5 L2,17 L14.5,12 Z" />';
+            }
+
+            const htmlIcon =
+              '<div style="transform: rotate(' +
+              endHeading +
+              'deg); display: inline-block; width: 32px; height: 32px;"><svg viewBox="0 0 32 32" width="32" height="32" style="display: block;">' +
+              svgContent +
+              "</svg></div>";
+            const planeIcon = L.divIcon({
+              html: htmlIcon,
+              className: "custom-adsb-icon",
+              iconSize: L.point(32, 32),
+              iconAnchor: L.point(16, 16),
+            });
+
+            if (airplaneMarkers[aircraft.hex]) {
+              airplaneMarkers[aircraft.hex].setLatLng([
+                aircraft.lat,
+                aircraft.lon,
+              ]);
+              airplaneMarkers[aircraft.hex].setIcon(planeIcon);
+
+              if (activeTrackedHex === aircraft.hex && activeFlightPath) {
+                activeFlightPath.setLatLngs(airplaneHistory[aircraft.hex]);
+              }
+            } else {
+              const marker = L.marker([aircraft.lat, aircraft.lon], {
+                icon: planeIcon,
+              }).addTo(map);
+
+              marker.on("click", () => {
+                if (activeFlightPath) map.removeLayer(activeFlightPath);
+                activeTrackedHex = aircraft.hex;
+                activeFlightPath = L.polyline(airplaneHistory[aircraft.hex], {
+                  color: "#000000",
+                  weight: 2.5,
+                  opacity: 0.8,
+                  dashArray: "5, 5",
+                }).addTo(map);
+              });
+
+              marker.bindPopup(
+                "<b>" +
+                  vehicleEmoji +
+                  "</b> " +
+                  flightInfo.callsign +
+                  " (" +
+                  flightInfo.type +
+                  ")<br><b>Altitude:</b> " +
+                  flightInfo.altitude +
+                  " ft<br><b>Speed:</b> " +
+                  flightInfo.speed +
+                  " kts<br><b>Heading:</b> " +
+                  flightInfo.heading +
+                  "°",
+              );
+              airplaneMarkers[aircraft.hex] = marker;
+            }
+          });
+        } catch (err) {
+          console.error(err);
+        }
+      }
+      // Live Satellite Extraction through CelesTrak active data link
+      async function fetchSatellites() {
+        try {
+          const targetUrl =
+            "https://" +
+            "celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle";
+          const proxyUrl =
+            "https://allorigins.win" + encodeURIComponent(targetUrl);
+          const response = await fetch(proxyUrl);
+          const json = await response.json();
+
+          if (!json || !json.contents) return;
+          const lines = json.contents.split("\n");
+
+          rawSatelliteData = [];
+          for (let i = 0; i < lines.length - 2; i += 3) {
+            if (lines[i].trim()) {
+              rawSatelliteData.push({
+                name: lines[i].trim(),
+                line1: lines[i + 1].trim(),
+                line2: lines[i + 2].trim(),
+              });
+            }
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      function updateSatellitePositions() {
+        if (
+          !rawSatelliteData.length ||
+          !map ||
+          typeof satellite === "undefined"
+        )
+          return;
+        const now = new Date();
+        const bounds = map.getBounds();
+
+        rawSatelliteData.forEach((sat) => {
+          try {
+            const satrec = satellite.twoline2satrec(sat.line1, sat.line2);
+            const positionAndVelocity = satellite.propagate(satrec, now);
+            const positionEci = positionAndVelocity.position;
+            if (!positionEci) return;
+
+            const gmst = satellite.gfy(now);
+            const positionGd = satellite.eciToGeodetic(positionEci, gmst);
+            const lat = satellite.degreesLat(positionGd.latitude);
+            const lon = satellite.degreesLong(positionGd.longitude);
+            const alt = Math.round(positionGd.height);
+
+            const satLatLng = L.latLng(lat, lon);
+
+            if (bounds.contains(satLatLng)) {
+              if (isRecording) {
+                recordedSatellites.push({ name: sat.name, lat, lon, alt });
+              }
+
+              if (satelliteMarkers[sat.name]) {
+                satelliteMarkers[sat.name].setLatLng(satLatLng);
+              } else {
+                const satIcon = L.divIcon({
+                  html: '<div style="font-size:22px; text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000;">🛰️</div>',
+                  className: "custom-sat-icon",
+                  iconSize: L.point(24, 24),
+                  iconAnchor: L.point(12, 12),
+                });
+                satelliteMarkers[sat.name] = L.marker(satLatLng, {
+                  icon: satIcon,
+                })
+                  .addTo(map)
+                  .bindPopup(
+                    "<b>🛰️ Satellite:</b> " +
+                      sat.name +
+                      "<br>Altitude: " +
+                      alt +
+                      " km",
+                  );
+              }
+            } else if (satelliteMarkers[sat.name]) {
+              map.removeLayer(satelliteMarkers[sat.name]);
+              delete satelliteMarkers[sat.name];
+            }
+          } catch (e) {}
+        });
+      }
+
+      // Client-side LocalStorage telemetry logger engine
+      function setupRecording() {
+        const recordBtn = document.getElementById("recordBtn");
+        recordBtn.addEventListener("click", () => {
+          if (!isRecording) {
+            isRecording = true;
+            recordedAirplanes = [];
+            recordedSatellites = [];
+            recordBtn.innerText = "🛑 Stop & Save Session";
+            recordBtn.classList.add("btn-recording");
+          } else {
+            isRecording = false;
+            recordBtn.innerText = "🔴 Start Recording";
+            recordBtn.classList.remove("btn-recording");
+
+            const newRecord = {
+              timestamp: new Date().toLocaleString(),
+              location:
+                "Lat: " + userLat.toFixed(2) + ", Lon: " + userLon.toFixed(2),
+              planesCount: [...new Set(recordedAirplanes.map((a) => a.hex))]
+                .length,
+              satsCount: [...new Set(recordedSatellites.map((s) => s.name))]
+                .length,
+            };
+
+            let localData =
+              JSON.parse(localStorage.getItem("radar_records")) || [];
+            localData.push(newRecord);
+            localStorage.setItem("radar_records", JSON.stringify(localData));
+            loadLocalRecords();
+          }
+        });
+
+        map.on("click", (e) => {
+          if (
+            e.originalEvent.target.id === "map" ||
+            e.originalEvent.target.classList.contains("leaflet-container")
+          ) {
+            if (activeFlightPath) {
+              map.removeLayer(activeFlightPath);
+              activeFlightPath = null;
+              activeTrackedHex = null;
+            }
+          }
+        });
+
+        setInterval(fetchAirplanes, 6000);
+        //setInterval(updateSatellitePositions, 1000);
+        //setInterval(fetchSatellites, 60000);
+      }
+
+      function loadLocalRecords() {
+        const tbody = document.querySelector("#recordsTable tbody");
+        tbody.innerHTML = "";
+        const localData =
+          JSON.parse(localStorage.getItem("radar_records")) || [];
+        localData.reverse().forEach((r) => {
+          tbody.innerHTML +=
+            "<tr><td>" +
+            r.timestamp +
+            "</td><td>" +
+            r.location +
+            "</td><td>" +
+            r.planesCount +
+            "</td><td>" +
+            r.satsCount +
+            "</td></tr>";
+        });
+      }
+    </script>
+  </body>
+</html>
