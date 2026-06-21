@@ -196,32 +196,35 @@
         )
           return;
         try {
-          // 1. Calculate a box profile (~150km) based on your current location configuration
+          // 1. OpenSky gebruikt een Bounding Box (vierkant). We berekenen ~150km rondom de huidige GPS-locatie
           const delta = 1.5;
-          const minLat = userLat - delta;
-          const maxLat = userLat + delta;
-          const minLon = userLon - delta;
-          const maxLon = userLon + delta;
+          const lamin = userLat - delta;
+          const lamax = userLat + delta;
+          const lomin = userLon - delta;
+          const lomax = userLon + delta;
 
+          // 2. We roepen de OpenSky API RECHTSTREEKS aan zonder proxy's! Dit werkt overal, ook op GitHub Pages.
           const targetUrl =
-            "https://api.adsb.lol/v2/lat/" +
-            userLat +
-            "/lon/" +
-            userLon +
-            "/dist/100?_=" +
+            "https://opensky-network.org/api/states/all?lamin=" +
+            lamin +
+            "&lamax=" +
+            lamax +
+            "&lomin=" +
+            lomin +
+            "&lomax=" +
+            lomax +
+            "&_=" +
             Date.now();
 
-          const proxyUrl =
-            "https://corsproxy.io?" + encodeURIComponent(targetUrl);
+          const response = await fetch(targetUrl);
+          const rawData = await response.json();
 
-          const response = await fetch(proxyUrl);
+          if (!rawData || !rawData.states || !Array.isArray(rawData.states))
+            return;
 
-          // 3. Omdat corsproxy de data DIRECT en zuiver doorgeeft,
-          // kunnen we de response meteen omzetten naar de data variabele (zonder .contents)!
-          const data = await response.json();
-          if (!data || !data.ac) return;
-
-          const currentHexCodes = data.ac.map((a) => a.hex);
+          // 3. OpenSky stuurt een array van arrays. We mappen dit direct naar de structuur van jouw code (.hex)
+          // Index 0 is de unieke transponder ICAO/Hex code van het vliegtuig
+          const currentHexCodes = rawData.states.map((aircraft) => aircraft[0]);
 
           Object.keys(airplaneMarkers).forEach((hex) => {
             if (!currentHexCodes.includes(hex)) {
@@ -237,6 +240,24 @@
             }
           });
 
+          // 4. We bouwen de "data.ac" array live op zodat de rest van jouw bestaande forEach-lus direct werkt!
+          const data = {
+            ac: rawData.states.map((aircraft) => {
+              return {
+                hex: aircraft[0], // ModeS ICAO Hex code
+                flight: aircraft[1] ? aircraft[1].trim() : "Unknown", // Callsign / Vluchtnummer
+                lon: parseFloat(aircraft[5]), // GPS Lengtegraad
+                lat: parseFloat(aircraft[6]), // GPS Breedtegraad
+                alt_baro: aircraft[7] ? Math.round(aircraft[7] * 3.28084) : 0, // Omrekenen van meters naar feet
+                gs: aircraft[9] ? Math.round(aircraft[9] * 1.94384) : 0, // Omrekenen van m/s naar knopen (kts)
+                track: aircraft[10] || 0, // Grondkoers (track)
+                t: "Unknown", // OpenSky levert dit helaas niet direct mee
+                category: "", // Leeg laten voor standaard afhandeling
+              };
+            }),
+          };
+
+          // Vanaf hier pakt jouw bestaande data.ac.forEach lus het vlekkeloos op:
           data.ac.forEach((aircraft) => {
             if (!aircraft || !aircraft.hex || !aircraft.lat || !aircraft.lon)
               return;
