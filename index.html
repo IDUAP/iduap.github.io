@@ -213,10 +213,7 @@
 
           // 2. We knippen de AllOrigins link op in losse strings om chat-misvorming te voorkomen
           const proxyUrl =
-            "https://" +
-            "api.allorigins.win" +
-            "/get?url=" +
-            encodeURIComponent(targetUrl);
+            "https://" + "api.allorigins.win" + "/get?url=" + targetUrl;
 
           const response = await fetch(proxyUrl);
           const json = await response.json();
